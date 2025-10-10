@@ -33,6 +33,8 @@ def register(cls: Type[InferenceEngine]) -> Type[InferenceEngine]:
         raise ValueError(f"Engine '{cls.name}' already registered")
 
     _ENGINES[cls.name] = cls
+
+    print("test")
     return cls
 
 
@@ -52,5 +54,7 @@ def list_engines() -> Dict[str, Type[InferenceEngine]]:
 # Explicitly import engines to register them
 # (Add new imports here as you create new engines)
 from . import baseline
+from . import sampling
+from . import kv_cache
 
 __all__ = ['InferenceEngine', 'register', 'get_engine', 'list_engines']
