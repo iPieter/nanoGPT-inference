@@ -21,7 +21,7 @@ seed = 1337
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = False # use PyTorch 2.0 to compile the model to be faster
-engine = 'baseline' # which inference engine to use (see inference/ folder)
+engine = 'kv_cache' # which inference engine to use (see inference/ folder)
 exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
 
@@ -85,12 +85,17 @@ if start.startswith('FILE:'):
     with open(start[5:], 'r', encoding='utf-8') as f:
         start = f.read()
 start_ids = encode(start)
-x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+x = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]
+
+# create batch by repeating the prompt num_samples times
+x_batch = x.repeat(num_samples, 1)  # (num_samples, T)
 
 # run generation
 with torch.no_grad():
     with ctx:
+        y = inference_engine.generate(x_batch, max_new_tokens, temperature=temperature, top_k=top_k)
+
+        # print each sample
         for k in range(num_samples):
-            y = inference_engine.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-            print(decode(y[0].tolist()))
+            print(decode(y[k].tolist()))
             print('---------------')
