@@ -1,5 +1,8 @@
 
-# nanoGPT
+# nanoGPT-inference
+This is a WIP repo with some inference optimizations (e.g. KV caching, fused kernels for rejection sampling) in `inference/`.
+
+-------
 
 ![nanoGPT](assets/nanogpt.jpg)
 
