@@ -260,6 +260,35 @@ class GPT(nn.Module):
 
         return model
 
+    @classmethod
+    def init_empty_weights(cls, model_type, override_args=None):
+        assert model_type in {'empty-1B', 'empty-2B', 'empty-4B', 'empty-10B', 'empty-16B'}
+        override_args = override_args or {} # default to empty dict
+
+        # n_layer, n_head and n_embd are determined from model_type
+        config_args = {
+            'empty-1B':         dict(n_layer=24, n_head=16, n_embd=1792),  # 1.0B params
+            'empty-2B':         dict(n_layer=32, n_head=32, n_embd=2304),  # 2.15B params
+            'empty-4B':         dict(n_layer=32, n_head=32, n_embd=3328),  # 4.4B params
+            'empty-10B':         dict(n_layer=48, n_head=48, n_embd=4128),  # 10.0B params
+            'empty-16B':        dict(n_layer=64, n_head=64, n_embd=4608),  # 16.5B params
+        }[model_type]
+
+        # we just use the same architecture as GPT-2, only changing the size
+        print("forcing vocab_size=50257, block_size=1024, bias=True")
+        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
+        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
+        config_args['bias'] = True # always True for GPT model checkpoints
+        # we can override the dropout rate, if desired
+        if 'dropout' in override_args:
+            print(f"overriding dropout rate to {override_args['dropout']}")
+            config_args['dropout'] = override_args['dropout']
+        # create a from-scratch initialized minGPT model
+        config = GPTConfig(**config_args)
+        model = GPT(config)
+        return model
+
+
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}

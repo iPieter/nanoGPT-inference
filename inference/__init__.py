@@ -34,7 +34,6 @@ def register(cls: Type[InferenceEngine]) -> Type[InferenceEngine]:
 
     _ENGINES[cls.name] = cls
 
-    print("test")
     return cls
 
 
@@ -56,5 +55,7 @@ def list_engines() -> Dict[str, Type[InferenceEngine]]:
 from . import baseline
 from . import sampling
 from . import kv_cache
+from . import fp8
+from . import fp8_static
 
 __all__ = ['InferenceEngine', 'register', 'get_engine', 'list_engines']

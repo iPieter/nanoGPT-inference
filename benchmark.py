@@ -31,7 +31,7 @@ compare = False  # compare multiple engines side-by-side
 init_from = 'gpt2'  # 'resume' or gpt2 variant
 out_dir = 'out'
 prompt_lengths = [32]  # list of prompt lengths to test
-batch_sizes = [2**i for i in range(10)]  # list of batch sizes to test, default 1 to 512
+batch_sizes = [2**i for i in range(4,10)]  # list of batch sizes to test, default 1 to 512
 max_new_tokens = 100  # tokens to generate per sample
 num_runs = 5  # number of runs to average over
 warmup_runs = 2  # warmup runs (not counted)
@@ -44,13 +44,17 @@ cooldown_seconds = 10  # seconds to wait between engines (e.g., 180 for 3 min)
 save_results = True  # save results to JSON
 results_dir = 'benchmark_results'  # where to save results
 plot_dir = 'plots'  # where to save plots
+profile_engines = []  # list of engines to profile (e.g., ['fp8', 'sampling'])
+profile_dir = 'profiles'  # where to save profiler traces
 exec(open('configurator.py').read())
 # -----------------------------------------------------------------------------
 
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
+
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
 device_type = 'cuda' if 'cuda' in device else 'cpu'
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
@@ -74,6 +78,10 @@ if init_from == 'resume':
     model.load_state_dict(state_dict)
 elif init_from.startswith('gpt2'):
     model = GPT.from_pretrained(init_from, dict(dropout=0.0))
+elif init_from.startswith('empty-'):
+    model = GPT.init_empty_weights(init_from, dict(dropout=0.0))
+
+
 
 model.eval()
 model.to(device)
@@ -184,7 +192,7 @@ def benchmark_engine(engine_name, prompt_length, batch_size, max_new_tokens, num
 
     result = BenchmarkResult(engine_name, prompt_length, batch_size, max_new_tokens)
 
-    # Warmup
+    # Warmup (FP8 needs more warmup for torch.compile)
     print(f"  Warming up ({warmup_runs} runs)...", end='', flush=True)
     with torch.no_grad():
         with ctx:
@@ -193,6 +201,36 @@ def benchmark_engine(engine_name, prompt_length, batch_size, max_new_tokens, num
                 if device_type == 'cuda':
                     torch.cuda.synchronize()
     print(" done")
+
+    # Profiling (if enabled for this engine)
+    if engine_name in profile_engines:
+        print(f"  Profiling {engine_name}...", end='', flush=True)
+        os.makedirs(profile_dir, exist_ok=True)
+        profile_path = os.path.join(profile_dir, f"profile_{engine_name}_bs{batch_size}.json")
+
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_flops=True,
+        ) as prof:
+            with torch.no_grad():
+                with ctx:
+                    _ = engine.generate(prompt, max_new_tokens, temperature=1.0, top_k=20, top_p=0.9)
+
+        prof.export_chrome_trace(profile_path)
+        print(f" saved to {profile_path}")
+
+        # Print summary
+        print("\n" + "="*80)
+        print(f"Top 10 GPU time consumers for {engine_name}:")
+        print("="*80)
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+        print("="*80 + "\n")
 
     # Benchmark runs
     print(f"  Running benchmark ({num_runs} runs)...", end='', flush=True)
