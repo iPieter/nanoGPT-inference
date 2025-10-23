@@ -114,14 +114,8 @@ class ExternalCachedSelfAttention(CausalSelfAttention):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # Update external cache and get full cached keys/values
-        if kv_cache is not None:
-            k_full, v_full = kv_cache.update(self.layer_idx, k, v)
-        else:
-            # No cache - use current k, v directly
-            k_full, v_full = k, v
+        k_full, v_full = kv_cache.update(self.layer_idx, k, v)
 
-        print("shapes:", q.shape, k_full.shape, v_full.shape, attn_mask.shape if attn_mask is not None else None)
         y = F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=attn_mask)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
@@ -147,6 +141,9 @@ class CUDAGraphEngine(InferenceEngine):
             block.attn = cached_attn
 
         self.kv_cache = None
+
+        # CUDA graphs cache: dict[(batch_size, seq_len)] -> (graph, static_inputs, static_outputs)
+        self.cuda_graphs = {}
 
     def _forward_with_cache(self, idx, position_offset=0, attn_mask=None):
         """
@@ -215,7 +212,7 @@ class CUDAGraphEngine(InferenceEngine):
                 # Prefill: causal mask for prompt, zeros for future positions
                 # L = prompt_len, S = max_seq_len
                 prompt_len = idx.size(1)
-                # Create full mask with static shape: (1, 1, prompt_len, max_seq_len)
+                # Create full mask with static shape: (1, 1, prompt_len, max_seq_len) (this gets broadcasted)
                 attn_mask = torch.zeros(1, 1, prompt_len, max_seq_len, dtype=torch.bool, device=device)
                 # Fill in causal mask for actual prompt positions
                 causal = torch.tril(torch.ones(prompt_len, prompt_len, dtype=torch.bool, device=device))
@@ -225,12 +222,33 @@ class CUDAGraphEngine(InferenceEngine):
                 # L = 1 (single query), S = max_seq_len (static)
                 # The cache has been updated with new k,v, so cache_len includes the new token
                 cache_len = self.kv_cache.get_current_length() + 1  # +1 for the token being added
-                # Create mask: (1, 1, 1, max_seq_len)
+                # Create mask: (1, 1, 1, max_seq_len) (again broad casted to batch)
                 attn_mask = torch.zeros(1, 1, 1, max_seq_len, dtype=torch.bool, device=device)
                 # Allow attention to all valid cached positions
                 attn_mask[0, 0, 0, :cache_len] = True
 
-            logits, _ = self._forward_with_cache(idx_input, position_offset=position_offset, attn_mask=attn_mask)
+            # Check if we have a CUDA graph for this (batch_size, seq_len) combination
+            B, L = idx_input.size()
+            graph_key = (B, L)
+
+            if graph_key not in self.cuda_graphs:
+                print("Capture CUDA graph for", graph_key)
+                static_input = torch.zeros(B, L, dtype=torch.long, device=device)
+                static_attn_mask = torch.zeros_like(attn_mask)
+
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    static_logits, _ = self._forward_with_cache(static_input, position_offset, static_attn_mask)
+
+                self.cuda_graphs[graph_key] = (g, static_input, static_attn_mask, static_logits)
+
+            # Use captured graph
+            g, static_input, static_attn_mask, static_logits = self.cuda_graphs[graph_key]
+            static_input.copy_(idx_input)
+            static_attn_mask.copy_(attn_mask)
+            g.replay()
+            logits = static_logits.clone()  # Clone to avoid overwriting in next iteration
+
             logits = logits[:, -1, :] / temperature
 
             # Advance cache position after prefill
