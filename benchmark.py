@@ -31,10 +31,10 @@ compare = False  # compare multiple engines side-by-side
 init_from = 'gpt2'  # 'resume' or gpt2 variant
 out_dir = 'out'
 prompt_lengths = [32]  # list of prompt lengths to test
-batch_sizes = [2**i for i in range(4,10)]  # list of batch sizes to test, default 1 to 512
+batch_sizes = [2**i for i in range(10)]  # list of batch sizes to test, default 1 to 512
 max_new_tokens = 100  # tokens to generate per sample
 num_runs = 5  # number of runs to average over
-warmup_runs = 2  # warmup runs (not counted)
+warmup_runs = 10  # warmup runs (not counted)
 device = 'cuda'  # 'cpu', 'cuda', 'cuda:0', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
 compile = False  # compile model for speed
@@ -202,39 +202,31 @@ def benchmark_engine(engine_name, prompt_length, batch_size, max_new_tokens, num
                     torch.cuda.synchronize()
     print(" done")
 
-    # Profiling (if enabled for this engine)
-    if engine_name in profile_engines:
-        print(f"  Profiling {engine_name}...", end='', flush=True)
-        os.makedirs(profile_dir, exist_ok=True)
-        profile_path = os.path.join(profile_dir, f"profile_{engine_name}_bs{batch_size}.json")
-
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=True,
-            with_flops=True,
-        ) as prof:
-            with torch.no_grad():
-                with ctx:
-                    _ = engine.generate(prompt, max_new_tokens, temperature=1.0, top_k=20, top_p=0.9)
-
-        prof.export_chrome_trace(profile_path)
-        print(f" saved to {profile_path}")
-
-        # Print summary
-        print("\n" + "="*80)
-        print(f"Top 10 GPU time consumers for {engine_name}:")
-        print("="*80)
-        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-        print("="*80 + "\n")
-
     # Benchmark runs
     print(f"  Running benchmark ({num_runs} runs)...", end='', flush=True)
+
+    # Profiler setup (will be used only on first run if enabled)
+    profiler = None
+    profile_path = None
+    if engine_name in profile_engines:
+        os.makedirs(profile_dir, exist_ok=True)
+        profile_path = os.path.join(profile_dir, f"profile_{engine_name}_bs{batch_size}.json")
+        print(f" (profiling first run)")
+
     for run in range(num_runs):
+        # Enable profiler only for first run
+        if run == 0 and engine_name in profile_engines:
+            profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+                with_flops=True,
+            )
+            profiler.__enter__()
         if device_type == 'cuda':
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.synchronize()
@@ -277,7 +269,24 @@ def benchmark_engine(engine_name, prompt_length, batch_size, max_new_tokens, num
 
         result.add_run(ttft, itl, total_time, mem_alloc, mem_res)
 
+        # Close profiler after first run
+        if run == 0 and profiler is not None:
+            profiler.__exit__(None, None, None)
+
     print(" done")
+
+    # Save and print profiler results if enabled
+    if profiler is not None:
+        profiler.export_chrome_trace(profile_path)
+        print(f"  Profiler trace saved to {profile_path}")
+
+        # Print summary
+        print("\n" + "="*80)
+        print(f"Top 10 GPU time consumers for {engine_name}:")
+        print("="*80)
+        print(profiler.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+        print("="*80 + "\n")
+
     return result
 
 
@@ -299,17 +308,35 @@ for prompt_length in prompt_lengths:
         for idx, engine_name in enumerate(engine_list):
             print(f"\n  Benchmarking engine: {engine_name}")
 
-            result = benchmark_engine(
-                engine_name,
-                prompt_length,
-                batch_size,
-                max_new_tokens,
-                num_runs,
-                warmup_runs
-            )
+            try:
+                result = benchmark_engine(
+                    engine_name,
+                    prompt_length,
+                    batch_size,
+                    max_new_tokens,
+                    num_runs,
+                    warmup_runs
+                )
 
-            result.print_summary()
-            all_results.append(result)
+                result.print_summary()
+                all_results.append(result)
+
+            except torch.OutOfMemoryError as e:
+                print(f"\n  ERROR: Engine {engine_name} ran out of memory!")
+                print(f"  {str(e)}")
+                print(f"  Skipping this engine and continuing...\n")
+                # Clear CUDA cache to free up memory for next engine
+                if device_type == 'cuda':
+                    torch.cuda.empty_cache()
+                continue
+            except Exception as e:
+                print(f"\n  ERROR: Engine {engine_name} failed with exception!")
+                print(f"  {type(e).__name__}: {str(e)}")
+                print(f"  Skipping this engine and continuing...\n")
+                # Clear CUDA cache just in case
+                if device_type == 'cuda':
+                    torch.cuda.empty_cache()
+                continue
 
             # Cooldown between engines to let GPU temperature stabilize
             if cooldown_seconds > 0:

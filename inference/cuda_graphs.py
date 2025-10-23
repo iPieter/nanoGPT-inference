@@ -93,13 +93,15 @@ class ExternalCachedSelfAttention(CausalSelfAttention):
         super().__init__(config)
         self.layer_idx = layer_idx
 
-    def forward(self, x, kv_cache: KVCache | None = None, attn_mask: torch.Tensor | None = None):
+    def forward(self, x, k_cache=None, v_cache=None, cache_position=None, attn_mask: torch.Tensor | None = None):
         """
-        Forward pass with optional external KV cache and attention mask.
+        Forward pass with external KV cache tensors and attention mask.
 
         Args:
             x: Input tensor (B, T, C)
-            kv_cache: Optional external KV cache to use
+            k_cache: Key cache tensor (B, nh, max_seq_len, hs) - written to in-place
+            v_cache: Value cache tensor (B, nh, max_seq_len, hs) - written to in-place
+            cache_position: Tensor scalar indicating where to write in cache
             attn_mask: Optional attention mask (B, 1, T, S) where S is cached sequence length
                       True/1.0 = attend, False/-inf = ignore
 
@@ -114,7 +116,23 @@ class ExternalCachedSelfAttention(CausalSelfAttention):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        k_full, v_full = kv_cache.update(self.layer_idx, k, v)
+        if k_cache is not None and v_cache is not None and cache_position is not None:
+            # Write k, v to cache at the specified position using tensor indexing
+            # Use index_copy to avoid .item() which isn't allowed in CUDA graphs
+            pos = cache_position[0]  # Extract scalar but keep as tensor operation
+
+            # Create indices for the positions to write to
+            indices = torch.arange(T, device=k.device) + pos
+
+            # Use index_copy_ to write k, v to cache (CUDA graph compatible)
+            k_cache.index_copy_(2, indices, k)
+            v_cache.index_copy_(2, indices, v)
+
+            # Use full cache for attention
+            k_full, v_full = k_cache, v_cache
+        else:
+            # No cache - use current k, v directly
+            k_full, v_full = k, v
 
         y = F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=attn_mask)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
@@ -145,10 +163,17 @@ class CUDAGraphEngine(InferenceEngine):
         # CUDA graphs cache: dict[(batch_size, seq_len)] -> (graph, static_inputs, static_outputs)
         self.cuda_graphs = {}
 
-    def _forward_with_cache(self, idx, position_offset=0, attn_mask=None):
+    def _forward_with_cache(self, idx, position_offset=0, attn_mask=None, last_token_idx=None, cache_position=None):
         """
         Forward pass that injects KV cache and attention mask into attention layers.
-        Based on GPT.forward() from model.py, modified to pass kv_cache and attn_mask to attention.
+        Based on GPT.forward() from model.py, modified to pass cache tensors and attn_mask to attention.
+
+        Args:
+            idx: Input tensor
+            position_offset: Position offset for embeddings
+            attn_mask: Attention mask
+            last_token_idx: Index tensor for selecting which position to compute logits for.
+            cache_position: Tensor scalar for cache write position
         """
         device = idx.device
         b, t = idx.size()
@@ -159,13 +184,20 @@ class CUDAGraphEngine(InferenceEngine):
         tok_emb = self.model.transformer.wte(idx)
         pos_emb = self.model.transformer.wpe(pos)
         x = self.model.transformer.drop(tok_emb + pos_emb)
-        for block in self.model.transformer.h:
-            # Modified: pass kv_cache and attn_mask to attention instead of using block(x)
-            x = x + block.attn(block.ln_1(x), self.kv_cache, attn_mask)
+        for layer_idx, block in enumerate(self.model.transformer.h):
+            # Get this layer's cache slices
+            k_cache = self.kv_cache.k_cache[layer_idx] if self.kv_cache else None
+            v_cache = self.kv_cache.v_cache[layer_idx] if self.kv_cache else None
+            # Modified: pass cache tensors, position, and attn_mask to attention
+            x = x + block.attn(block.ln_1(x), k_cache, v_cache, cache_position, attn_mask)
             x = x + block.mlp(block.ln_2(x))
         x = self.model.transformer.ln_f(x)
 
-        logits = self.model.lm_head(x[:, [-1], :])
+        # equivalent to lm_head([:, [-1], :]) but CUDA graph friendly
+        if last_token_idx is not None:
+            x = torch.index_select(x, 1, last_token_idx)  # (B, 1, n_embd)
+
+        logits = self.model.lm_head(x)
         loss = None
 
         return logits, loss
@@ -193,7 +225,7 @@ class CUDAGraphEngine(InferenceEngine):
             num_heads=self.config.n_head,
             head_dim=head_dim,
             max_seq_len=max_seq_len,
-            dtype=next(self.model.parameters()).dtype,
+            dtype=torch.bfloat16,
             device=device
         )
 
@@ -235,21 +267,43 @@ class CUDAGraphEngine(InferenceEngine):
                 print("Capture CUDA graph for", graph_key)
                 static_input = torch.zeros(B, L, dtype=torch.long, device=device)
                 static_attn_mask = torch.zeros_like(attn_mask)
+                # Static index for last token (L-1)
+                static_last_token_idx = torch.tensor([L - 1], dtype=torch.long, device=device)
+                # Static cache position - will be updated via copy_ during replay
+                static_cache_position = torch.tensor([self.kv_cache.get_current_length()], dtype=torch.long, device=device)
 
+                # Important: Fill static_input with actual data before warmup/capture
+                # Otherwise KV cache gets filled with garbage from zero inputs
+                static_input.copy_(idx_input)
+                static_attn_mask.copy_(attn_mask)
+
+                # Synchronize streams before capture
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    # Warmup iterations
+                    for _ in range(3):
+                        self._forward_with_cache(static_input, position_offset, static_attn_mask, static_last_token_idx, static_cache_position)
+                torch.cuda.current_stream().wait_stream(s)
+
+                # Capture graph
                 g = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(g):
-                    static_logits, _ = self._forward_with_cache(static_input, position_offset, static_attn_mask)
+                    static_logits, _ = self._forward_with_cache(static_input, position_offset, static_attn_mask, static_last_token_idx, static_cache_position)
 
-                self.cuda_graphs[graph_key] = (g, static_input, static_attn_mask, static_logits)
+                self.cuda_graphs[graph_key] = (g, static_input, static_attn_mask, static_last_token_idx, static_cache_position, static_logits)
 
             # Use captured graph
-            g, static_input, static_attn_mask, static_logits = self.cuda_graphs[graph_key]
+            g, static_input, static_attn_mask, static_last_token_idx, static_cache_position, static_logits = self.cuda_graphs[graph_key]
             static_input.copy_(idx_input)
             static_attn_mask.copy_(attn_mask)
+            # Update cache position for this replay
+            static_cache_position.copy_(torch.tensor([self.kv_cache.get_current_length()], dtype=torch.long, device=device))
             g.replay()
             logits = static_logits.clone()  # Clone to avoid overwriting in next iteration
 
-            logits = logits[:, -1, :] / temperature
+            # logits shape is now (B, 1, vocab_size), squeeze to (B, vocab_size)
+            logits = logits.squeeze(1) / temperature
 
             # Advance cache position after prefill
             if i == 0:
