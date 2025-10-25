@@ -3,6 +3,7 @@ import copy
 import torch
 import torch.nn.functional as F
 from model import CausalSelfAttention
+from flashinfer import top_k_top_p_sampling_from_logits
 from . import register
 from .base import InferenceEngine
 
@@ -298,41 +299,26 @@ class CUDAGraphEngine(InferenceEngine):
             static_input.copy_(idx_input)
             static_attn_mask.copy_(attn_mask)
             # Update cache position for this replay
-            static_cache_position.copy_(torch.tensor([self.kv_cache.get_current_length()], dtype=torch.long, device=device))
+            static_cache_position.fill_(self.kv_cache.get_current_length())
             g.replay()
-            logits = static_logits.clone()  # Clone to avoid overwriting in next iteration
 
-            # logits shape is now (B, 1, vocab_size), squeeze to (B, vocab_size)
-            logits = logits.squeeze(1) / temperature
+            # No need to clone - we can work with static_logits directly since we're not modifying it
+            # Just squeeze and apply temperature
+            logits = static_logits.squeeze(1) / temperature
 
-            # Advance cache position after prefill
+            # Advance cache position
             if i == 0:
                 self.kv_cache.advance(idx_input.size(1))
             else:
                 self.kv_cache.advance(1)
 
-            # Optionally crop logits to only top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-
-            # Apply softmax after our tok_k to get probabilities
-            probs = F.softmax(logits, dim=-1)
-
-            # Apply top-p (nucleus) sampling
-            if top_p is not None:
-                sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-                # Remove tokens with cumulative probability above the threshold
-                sorted_indices_to_remove = cumulative_probs > top_p
-                # Keep at least the first token
-                sorted_indices_to_remove[..., 0] = False
-                # Scatter back to original indexing
-                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                probs[indices_to_remove] = 0.0
-
-            # Sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
+            # Use flashinfer optimized sampling kernel
+            idx_next = top_k_top_p_sampling_from_logits(
+                logits,
+                top_k=top_k if top_k is not None else -1,
+                top_p=top_p if top_p is not None else 1.0,
+                filter_apply_order="joint"
+            ).unsqueeze(-1)
 
             idx = torch.cat((idx, idx_next), dim=1)
 
