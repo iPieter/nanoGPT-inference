@@ -20,7 +20,7 @@ class KVCache:
         Args:
             num_layers: Number of transformer layers
             batch_size: Batch size
-            num_heads: Number of attention heads
+            num_heads: Number of attention heads (LOCAL to this device in TP mode)
             head_dim: Dimension of each attention head
             max_seq_len: Maximum sequence length to cache
             dtype: Data type for cache tensors
@@ -36,6 +36,7 @@ class KVCache:
 
         # Initialize cache tensors for all layers
         # Shape: (num_layers, batch_size, num_heads, max_seq_len, head_dim)
+        # In TP mode, num_heads is the local number of heads on this device
         self.k_cache = torch.zeros(
             num_layers, batch_size, num_heads, max_seq_len, head_dim,
             dtype=dtype, device=device
@@ -100,22 +101,30 @@ class ExternalCachedSelfAttention(CausalSelfAttention):
 
         Args:
             x: Input tensor (B, T, C)
-            k_cache: Key cache tensor (B, nh, max_seq_len, hs) - written to in-place
-            v_cache: Value cache tensor (B, nh, max_seq_len, hs) - written to in-place
+            k_cache: Key cache tensor (B, nh, max_seq_len, hs)
+            v_cache: Value cache tensor (B, nh, max_seq_len, hs)
             cache_position: Tensor scalar indicating where to write in cache
             attn_mask: Optional attention mask (B, 1, T, S) where S is cached sequence length
                       True/1.0 = attend, False/-inf = ignore
 
         Returns:
-            Output tensor (B, T, C)
+            Output tensor (B, T, C) 
         """
         B, T, C = x.size()
 
         # Compute queries, keys, and values
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        # In TP mode, c_attn is ColwiseParallel, so output is already sharded across heads
+        # c_attn output shape: (B, T, 3 * n_embd_local) where n_embd_local may be < n_embd
+        qkv = self.c_attn(x)
+        qkv_dim = qkv.size(-1) // 3  # Local embedding dimension per Q/K/V
+        q, k, v = qkv.split(qkv_dim, dim=2)
+
+        # n_head here reflects the LOCAL number of heads on this device
+        # head_dim is computed from local dimensions
+        head_dim = qkv_dim // self.n_head
+        k = k.view(B, T, self.n_head, head_dim).transpose(1, 2)
+        q = q.view(B, T, self.n_head, head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, head_dim).transpose(1, 2)
 
         if k_cache is not None and v_cache is not None and cache_position is not None:
             # Write k, v to cache at the specified position using tensor indexing
@@ -136,7 +145,11 @@ class ExternalCachedSelfAttention(CausalSelfAttention):
             k_full, v_full = k, v
 
         y = F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=attn_mask)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        # Reshape back: use local qkv_dim since heads are sharded
+        y = y.transpose(1, 2).contiguous().view(B, T, qkv_dim)
+
+        # In TP mode, c_proj is RowwiseParallel, so it performs all-reduce internally
+        # c_proj input is sharded (qkv_dim)
         y = self.resid_dropout(self.c_proj(y))
         return y
 
@@ -215,20 +228,27 @@ class CUDAGraphEngine(InferenceEngine):
         device = idx.device
         per_token_times = []
 
-        # Initialize external KV cache
+        # Initialize or reuse external KV cache
         batch_size = idx.size(0)
         max_seq_len = idx.size(1) + max_new_tokens
         head_dim = self.config.n_embd // self.config.n_head
 
-        self.kv_cache = KVCache(
-            num_layers=self.config.n_layer,
-            batch_size=batch_size,
-            num_heads=self.config.n_head,
-            head_dim=head_dim,
-            max_seq_len=max_seq_len,
-            dtype=torch.bfloat16,
-            device=device
-        )
+        # Reuse cache if it exists and has the right shape
+        if (self.kv_cache is None or
+            self.kv_cache.batch_size != batch_size or
+            self.kv_cache.max_seq_len < max_seq_len):
+            self.kv_cache = KVCache(
+                num_layers=self.config.n_layer,
+                batch_size=batch_size,
+                num_heads=self.config.n_head,
+                head_dim=head_dim,
+                max_seq_len=max_seq_len,
+                dtype=torch.bfloat16,
+                device=device
+            )
+        else:
+            # Clear existing cache for reuse
+            self.kv_cache.clear()
 
         for i in range(max_new_tokens):
             if device.type == 'cuda':
@@ -268,13 +288,9 @@ class CUDAGraphEngine(InferenceEngine):
                 print("Capture CUDA graph for", graph_key)
                 static_input = torch.zeros(B, L, dtype=torch.long, device=device)
                 static_attn_mask = torch.zeros_like(attn_mask)
-                # Static index for last token (L-1)
+                # Static index and cache position tensors
                 static_last_token_idx = torch.tensor([L - 1], dtype=torch.long, device=device)
-                # Static cache position - will be updated via copy_ during replay
                 static_cache_position = torch.tensor([self.kv_cache.get_current_length()], dtype=torch.long, device=device)
-
-                # Important: Fill static_input with actual data before warmup/capture
-                # Otherwise KV cache gets filled with garbage from zero inputs
                 static_input.copy_(idx_input)
                 static_attn_mask.copy_(attn_mask)
 
@@ -302,8 +318,7 @@ class CUDAGraphEngine(InferenceEngine):
             static_cache_position.fill_(self.kv_cache.get_current_length())
             g.replay()
 
-            # No need to clone - we can work with static_logits directly since we're not modifying it
-            # Just squeeze and apply temperature
+            # No need to clone, we can work with static_logits directly since we're not modifying it
             logits = static_logits.squeeze(1) / temperature
 
             # Advance cache position
